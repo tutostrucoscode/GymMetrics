@@ -21,13 +21,15 @@ import {
   ModalCloseButton,
   Image,
   IconButton,
+  useToast,
 } from "@chakra-ui/react";
-import { doc, getDoc, collection, getDocs } from "firebase/firestore";
+import { doc, getDoc, collection, getDocs, setDoc } from "firebase/firestore";
 import { db } from "@/configs/firebase";
 import TemplateGeneral from "@/features/ui/TemplateGeneral";
 import WeightInputModal from "@/features/modals/weightInput";
 import { Ico } from "@/assets/icons";
 import ExerciseLoading from "@/features/loading/ExerciseLoading";
+import ExerciseLogsTable from "@/features/exerciseLogsTable";
 
 interface Exercise {
   exerciseId: string;
@@ -81,6 +83,17 @@ interface ExerciseData {
   [date: string]: DailyEntry[];
 }
 
+interface ExerciseLog {
+  id: string;
+  name: string;
+  scheduledDay: string;
+  performedDate: string;
+  performedDay: string;
+  sets: number;
+  maxWeight: number;
+  minWeight: number;
+}
+
 const ExerciseDetailPage: React.FC = () => {
   const { routineId } = useParams<{ routineId: string }>();
   const [routine, setRoutine] = useState<Routine | null>(null);
@@ -91,6 +104,8 @@ const ExerciseDetailPage: React.FC = () => {
   const [exerciseWeights, setExerciseWeights] = useState<ExerciseWeightData>(
     {}
   );
+  const [filteredLogs, setFilteredLogs] = useState<ExerciseLog[]>([]);
+  const [filterDay, setFilterDay] = useState<string>("all");
 
   const {
     isOpen: isWeightModalOpen,
@@ -107,6 +122,11 @@ const ExerciseDetailPage: React.FC = () => {
   );
   const [selectedImage, setSelectedImage] = useState<string>("");
 
+  const [exerciseLogs, setExerciseLogs] = useState<ExerciseLog[]>([]);
+  const [loadingExerciseNames, setLoadingExerciseNames] = useState(true);
+
+  const toast = useToast();
+
   const handleOpenWeightModal = (exercise: Exercise) => {
     setSelectedExercise(exercise);
     onWeightModalOpen();
@@ -117,30 +137,89 @@ const ExerciseDetailPage: React.FC = () => {
     onImageModalOpen();
   };
 
+  const handleDeleteLog = async (logId: string) => {
+    try {
+      const [exerciseId, date, timestamp] = logId.split("_");
+      const docRef = doc(
+        db,
+        "exerciseData",
+        `${routine?.userId}_${routineId}_${exerciseId}`
+      );
+      const docSnap = await getDoc(docRef);
+      if (docSnap.exists()) {
+        const data = docSnap.data() as ExerciseData;
+        if (data[date]) {
+          data[date] = data[date].filter(
+            (entry: DailyEntry) => entry.timestamp !== timestamp
+          );
+          if (data[date].length === 0) {
+            delete data[date];
+          }
+          await setDoc(docRef, data);
+          setExerciseLogs((prevLogs) =>
+            prevLogs.filter((log) => log.id !== logId)
+          );
+          toast({
+            title: "Registro eliminado",
+            status: "success",
+            duration: 3000,
+            isClosable: true,
+          });
+        }
+      }
+    } catch (error) {
+      console.error("Error deleting log:", error);
+      toast({
+        title: "Error",
+        description:
+          "No se pudo eliminar el registro. Por favor, intente de nuevo.",
+        status: "error",
+        duration: 3000,
+        isClosable: true,
+      });
+    }
+  };
+
+  const handleEditLog = (log: ExerciseLog) => {
+    const [exerciseId] = log.id.split("_");
+    const exercise = { exerciseId };
+    setSelectedExercise(exercise);
+    onWeightModalOpen();
+  };
+
+  const formatDate = (dateString: string): string => {
+    const [year, month, day] = dateString.split("-").map(Number);
+    return `${year}-${month.toString().padStart(2, "0")}-${day
+      .toString()
+      .padStart(2, "0")}`;
+  };
+
+  const getDayOfWeek = (dateString: string): string => {
+    const date = new Date(dateString + "T00:00:00Z"); // Aseguramos que se interprete como UTC
+    return new Intl.DateTimeFormat("es-ES", {
+      weekday: "long",
+      timeZone: "UTC",
+    }).format(date);
+  };
+
   useEffect(() => {
     const fetchRoutineAndExercises = async () => {
       if (!routineId) {
-        console.log("No routineId provided");
         setError("No se proporcionó un ID de rutina");
         setIsLoading(false);
         return;
       }
 
       setIsLoading(true);
+      setLoadingExerciseNames(true);
       try {
-        console.log("Fetching routine with ID:", routineId);
         const routineDoc = await getDoc(doc(db, "routines", routineId));
 
         if (routineDoc.exists()) {
-          console.log("Routine document exists");
           const routineData = routineDoc.data() as Omit<Routine, "id">;
-          console.log("Routine data:", routineData);
-
           setRoutine({ id: routineId, ...routineData });
           if (routineData.trainingDays && routineData.trainingDays.length > 0) {
             setSelectedDay(routineData.trainingDays[0]);
-          } else {
-            console.log("No training days found in routine data");
           }
 
           // Fetch exercise details
@@ -153,7 +232,8 @@ const ExerciseDetailPage: React.FC = () => {
           });
           setExerciseDetails(exercisesData);
 
-          // Fetch exercise weight data
+          // Fetch exercise logs and calculate max weights
+          const logs: ExerciseLog[] = [];
           const weightData: ExerciseWeightData = {};
           for (const dayRoutine of routineData.routines) {
             for (const exercise of dayRoutine.exercises) {
@@ -166,38 +246,50 @@ const ExerciseDetailPage: React.FC = () => {
               );
               if (exerciseDataDoc.exists()) {
                 const exerciseData = exerciseDataDoc.data() as ExerciseData;
-                const allWeights = Object.values(exerciseData)
-                  .flatMap((dailyEntries: DailyEntry[]) =>
-                    dailyEntries.flatMap((entry: DailyEntry) =>
-                      entry.sets.map((set) => set.weight)
-                    )
-                  )
-                  .filter((weight: number) => weight > 0);
+                let maxWeightForExercise = 0;
+                Object.entries(exerciseData).forEach(([date, dailyEntries]) => {
+                  dailyEntries.forEach((entry: DailyEntry) => {
+                    const weights = entry.sets
+                      .map((set) => set.weight)
+                      .filter((weight) => weight > 0);
+                    if (weights.length > 0) {
+                      const maxWeightForEntry = Math.max(...weights);
+                      maxWeightForExercise = Math.max(
+                        maxWeightForExercise,
+                        maxWeightForEntry
+                      );
 
-                if (allWeights.length > 0) {
-                  const weightCounts: { [key: number]: number } =
-                    allWeights.reduce(
-                      (acc: { [key: number]: number }, weight: number) => {
-                        acc[weight] = (acc[weight] || 0) + 1;
-                        return acc;
-                      },
-                      {}
-                    );
-                  const maxWeight = Object.entries(weightCounts).reduce(
-                    (a, b) => (a[1] > b[1] ? a : b)
-                  )[0];
-                  weightData[exercise.exerciseId] = Number(maxWeight);
-                } else {
-                  weightData[exercise.exerciseId] = null;
-                }
+                      const formattedDate = formatDate(date);
+                      const performedDay = getDayOfWeek(formattedDate);
+
+                      logs.push({
+                        id: `${exercise.exerciseId}_${date}_${entry.timestamp}`,
+                        name:
+                          exercisesData[exercise.exerciseId]?.name || "Unknown",
+                        scheduledDay: dayRoutine.day,
+                        performedDate: formattedDate,
+                        performedDay: performedDay,
+                        sets: entry.sets.length,
+                        maxWeight: maxWeightForEntry,
+                        minWeight: Math.min(...weights),
+                      });
+                    }
+                  });
+                });
+                weightData[exercise.exerciseId] =
+                  maxWeightForExercise > 0 ? maxWeightForExercise : null;
               } else {
                 weightData[exercise.exerciseId] = null;
               }
             }
           }
+
+          if (routineData && routineData.trainingDays.length > 0) {
+            setFilterDay(routineData.trainingDays[0]);
+          }
+          setExerciseLogs(logs);
           setExerciseWeights(weightData);
         } else {
-          console.log("Routine document does not exist");
           setError("No se encontró la rutina especificada");
         }
       } catch (error) {
@@ -205,11 +297,22 @@ const ExerciseDetailPage: React.FC = () => {
         setError("Error al cargar los datos. Por favor, intente de nuevo.");
       } finally {
         setIsLoading(false);
+        setLoadingExerciseNames(false);
       }
     };
 
     fetchRoutineAndExercises();
   }, [routineId]);
+
+  useEffect(() => {
+    if (filterDay === "all") {
+      setFilteredLogs(exerciseLogs);
+    } else {
+      setFilteredLogs(
+        exerciseLogs.filter((log) => log.scheduledDay === filterDay)
+      );
+    }
+  }, [filterDay, exerciseLogs]);
 
   if (isLoading) {
     return (
@@ -324,6 +427,30 @@ const ExerciseDetailPage: React.FC = () => {
           routineId={routineId || ""}
         />
       )}
+
+      <Box mt={8}>
+        <Heading size="md" mb={4}>
+          Registro de Ejercicios Realizados
+        </Heading>
+        <Select
+          value={filterDay}
+          onChange={(e) => setFilterDay(e.target.value)}
+          mb={4}
+        >
+          <option value="all">Todos los días</option>
+          {routine?.trainingDays.map((day) => (
+            <option key={day} value={day}>
+              {day}
+            </option>
+          ))}
+        </Select>
+        <ExerciseLogsTable
+          logs={filteredLogs}
+          loadingExerciseNames={loadingExerciseNames}
+          onEditLog={handleEditLog}
+          onDeleteLog={handleDeleteLog}
+        />
+      </Box>
 
       <Modal isOpen={isImageModalOpen} onClose={onImageModalClose} size="xl">
         <ModalOverlay />
